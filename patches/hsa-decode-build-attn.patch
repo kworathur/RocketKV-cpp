@@ -1,0 +1,338 @@
+diff --git a/include/llama.h b/include/llama.h
+index 01d8fb8..e469e41 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -435,6 +435,16 @@ extern "C" {
+         // a source/target/parent context
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
++
++        // RocketKV stage-2 hybrid sparse attention for single-token decode.
++        // hsa_topk == 0 leaves attention dense. Create the context with hsa_topk > 0
++        // so the graph reserve can hold the extra nodes, then install the real
++        // chunk, r, and topk with llama_set_hsa_params() before decoding.
++        // Layers with il < hsa_skip_layers stay dense (rocket.py skip_layers).
++        int32_t hsa_skip_layers;
++        int32_t hsa_chunk; // sequence chunk size c
++        int32_t hsa_r;     // head-dimension components kept
++        int32_t hsa_topk;  // tokens kept per KV head
+     };
+ 
+     struct llama_model_tensor_override {
+@@ -1105,6 +1115,16 @@ extern "C" {
+     // If set to true, the model will only attend to the past tokens
+     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+ 
++    // Install RocketKV stage-2 decode parameters. See llama_context_params.
++    // Non-positive chunk, r, or topk disables the sparse path.
++    // The context must have been created with hsa_topk > 0.
++    LLAMA_API void llama_set_hsa_params(
++            struct llama_context * ctx,
++            int32_t skip_layers,
++            int32_t chunk,
++            int32_t r,
++            int32_t topk);
++
+     // Returns whether the context is currently using causal attention
+     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b66092b..06709e9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -376,6 +376,10 @@ llama_context::llama_context(
+ 
+     cparams.op_offload     = params.op_offload;
+     cparams.kv_unified     = params.kv_unified;
++    cparams.hsa_skip_layers = std::max(0, params.hsa_skip_layers);
++    cparams.hsa_chunk       = std::max(0, params.hsa_chunk);
++    cparams.hsa_r           = std::max(0, params.hsa_r);
++    cparams.hsa_topk        = std::max(0, params.hsa_topk);
+     cparams.moe_cache_size      = params.moe_cache_size;
+     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+ 
+@@ -1694,6 +1698,17 @@ void llama_context::set_causal_attn(bool value) {
+     cparams.causal_attn = value;
+ }
+ 
++void llama_context::set_hsa_params(int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk) {
++    LLAMA_LOG_DEBUG("%s: skip = %d chunk = %d r = %d topk = %d\n", __func__, skip_layers, chunk, r, topk);
++
++    // shapes depend on these values, so allow_reuse rejects a graph built with different ones.
++    // the node reserve is fixed at context creation and includes the HSA chain only when hsa_topk > 0 then.
++    cparams.hsa_skip_layers = std::max(0, skip_layers);
++    cparams.hsa_chunk       = std::max(0, chunk);
++    cparams.hsa_r           = std::max(0, r);
++    cparams.hsa_topk        = std::max(0, topk);
++}
++
+ bool llama_context::get_causal_attn() const {
+     return cparams.causal_attn;
+ }
+@@ -2945,6 +2960,11 @@ uint32_t llama_context::graph_max_nodes() const {
+         res *= 4;
+     }
+ 
++    if (cparams.hsa_topk > 0) {
++        // one HSA chain per layer: sign, chunk pool, head gather, top-k, exact gather
++        res += 128u * model.hparams.n_layer();
++    }
++
+     return res;
+ }
+ 
+@@ -4457,6 +4477,10 @@ llama_context_params llama_context_default_params() {
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
++        /*.hsa_skip_layers             =*/ 0,
++        /*.hsa_chunk                   =*/ 0,
++        /*.hsa_r                       =*/ 0,
++        /*.hsa_topk                    =*/ 0,
+     };
+ 
+     return result;
+@@ -4679,6 +4703,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+     ctx->set_causal_attn(causal_attn);
+ }
+ 
++void llama_set_hsa_params(llama_context * ctx, int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk) {
++    ctx->set_hsa_params(skip_layers, chunk, r, topk);
++}
++
+ bool llama_get_causal_attn(const llama_context * ctx) {
+     return ctx->get_causal_attn();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 45eca45..69014d5 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -138,6 +138,7 @@ struct llama_context {
+     bool supports_state_row() const;
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
++    void set_hsa_params(int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk);
+ 
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 52c85bd..856edfb 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -73,4 +73,10 @@ struct llama_cparams {
+ 
+     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
+     llama_context * ctx_state_src;
++
++    // RocketKV stage-2 hybrid sparse attention. topk == 0 keeps dense attention.
++    int32_t hsa_skip_layers = 0;
++    int32_t hsa_chunk = 0;
++    int32_t hsa_r = 0;
++    int32_t hsa_topk = 0;
+ };
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 01354c3..b461587 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3315,6 +3315,124 @@ static ggml_tensor * build_attn_scale_kv_output(
+     return cur;
+ }
+ 
++static ggml_tensor * hsa_f32(ggml_context * ctx, ggml_tensor * t) {
++    return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
++}
++
++static ggml_tensor * hsa_perm(ggml_context * ctx, ggml_tensor * t, int a0, int a1, int a2, int a3) {
++    return ggml_cont(ctx, ggml_permute(ctx, t, a0, a1, a2, a3));
++}
++
++// Stage-2 hybrid sparse attention for a single decode token.
++// Equivalent of the non-prefill branch in NVlabs RocketKV rocket_forward:
++//   sign, chunk amax, top-r head gather, softmax, top-k tokens, exact attention.
++ggml_tensor * llm_graph_context::build_hsa_decode(
++        ggml_tensor * q,
++        ggml_tensor * k,
++        ggml_tensor * v,
++        ggml_tensor * kq_mask,
++        float         kq_scale,
++        int           il) const {
++    const int64_t D    = q->ne[0];
++    const int64_t Hkv  = k->ne[1];
++    const int64_t Hq   = q->ne[1];
++    const int64_t H    = Hq / Hkv;
++    const int64_t n_kv = k->ne[2];
++    const int chunk = cparams.hsa_chunk;
++    int r = cparams.hsa_r;
++    if (r > (int) D) {
++        r = (int) D;
++    }
++    const int64_t n_keep = std::min<int64_t>(cparams.hsa_topk, n_kv);
++    const int pad = (int) ((chunk - (n_kv % chunk)) % chunk);
++    const int64_t n_chunks = (n_kv + pad) / chunk;
++
++    GGML_ASSERT(H >= 1);
++    GGML_ASSERT(r >= 1 && n_keep >= 1 && n_chunks >= 1);
++
++    q = ggml_cont(ctx0, hsa_f32(ctx0, q));
++    k = hsa_f32(ctx0, k);
++    v = hsa_f32(ctx0, v);
++
++    // rocket.py: Q = h_q.view(batch, num_heads_kv, -1, len_q, dim_head); K = h_k.unsqueeze(2)
++    ggml_tensor * Q = ggml_reshape_4d(ctx0, q, D, H, Hkv, 1);
++    ggml_tensor * K = hsa_perm(ctx0, k, 0, 2, 1, 3); // [D, n_kv, Hkv, 1]
++    ggml_tensor * V = hsa_perm(ctx0, v, 0, 2, 1, 3);
++
++    // sign = +1 when the sum over the group is positive, else -1 (a zero sum included)
++    ggml_tensor * group_sum = ggml_sum_rows(ctx0, hsa_perm(ctx0, Q, 1, 0, 2, 3)); // [1, D, Hkv, 1]
++    ggml_tensor * one = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1.0f);
++    ggml_tensor * sign = ggml_sub(ctx0, ggml_scale(ctx0, ggml_step(ctx0, group_sum), 2.0f), one);
++    sign = hsa_perm(ctx0, sign, 1, 0, 2, 3); // [D, 1, Hkv, 1]
++
++    ggml_tensor * Qs = ggml_mul(ctx0, Q, sign);
++    ggml_tensor * Ks = ggml_mul(ctx0, K, sign);
++
++    // Cache padding is -inf in kq_mask. Apply it after the sign so those slots lose the max.
++    ggml_tensor * mask = ggml_cont(ctx0, hsa_f32(ctx0, kq_mask));
++    Ks = ggml_add(ctx0, Ks, ggml_reshape_4d(ctx0, mask, 1, n_kv, 1, 1));
++
++    // rocket.py: cat along the sequence with finfo.min, then amax inside each chunk
++    ggml_tensor * ks = hsa_perm(ctx0, Ks, 1, 0, 2, 3); // [n_kv, D, Hkv, 1]
++    if (pad > 0) {
++        ggml_tensor * tail = ggml_fill(ctx0,
++                ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, pad, D, Hkv, 1), -INFINITY);
++        ks = ggml_concat(ctx0, ks, tail, 0);
++    }
++    ggml_tensor * chunk_max = hsa_perm(ctx0,
++            ggml_pool_1d(ctx0, ks, GGML_OP_POOL_MAX, chunk, chunk, 0), 1, 0, 2, 3); // [D, n_chunks, Hkv, 1]
++
++    // i1 = topk(abs(Q).mean(dim=group), r) on the head dimension
++    ggml_tensor * abs_q = ggml_abs(ctx0, Q);
++    ggml_tensor * head_score = hsa_perm(ctx0,
++            ggml_mean(ctx0, hsa_perm(ctx0, abs_q, 1, 0, 2, 3)), 1, 0, 2, 3); // [D, 1, Hkv, 1]
++    ggml_tensor * i1 = hsa_perm(ctx0, ggml_top_k(ctx0, head_score, r), 0, 2, 1, 3); // [r, Hkv, 1, 1]
++
++    // _gather(positive_query, -1, i1), _gather(chunk_max_key, -1, i1)
++    ggml_tensor * q_hat = hsa_perm(ctx0,
++            ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3); // [r, H, Hkv, 1]
++    ggml_tensor * k_hat = hsa_perm(ctx0,
++            ggml_get_rows(ctx0, hsa_perm(ctx0, chunk_max, 1, 0, 2, 3), i1), 1, 0, 2, 3); // [r, n_chunks, Hkv, 1]
++
++    ggml_tensor * qk = ggml_mul_mat(ctx0, k_hat, q_hat); // [n_chunks, H, Hkv, 1]
++    qk = ggml_reshape_4d(ctx0, qk, 1, n_chunks, H, Hkv);
++    qk = ggml_repeat_4d(ctx0, qk, chunk, n_chunks, H, Hkv);
++    qk = ggml_reshape_3d(ctx0, qk, chunk * n_chunks, H, Hkv);
++    qk = ggml_cont(ctx0, ggml_view_3d(ctx0, qk, n_kv, H, Hkv, qk->nb[1], qk->nb[2], 0));
++    qk = ggml_add(ctx0, qk, mask);
++
++    // scale = sqrt(D * sum(|Q_hat|) / sum(|Q|)); s_hat = softmax(QK_hat / scale)
++    ggml_tensor * eps = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1e-6f);
++    ggml_tensor * sum_kept = ggml_sum_rows(ctx0, ggml_abs(ctx0, q_hat));
++    ggml_tensor * sum_all  = ggml_sum_rows(ctx0, abs_q);
++    ggml_tensor * scale = ggml_sqrt(ctx0, ggml_add(ctx0,
++            ggml_div(ctx0, ggml_scale(ctx0, sum_kept, (float) D), ggml_add(ctx0, sum_all, eps)),
++            eps));
++    ggml_tensor * s_hat = ggml_soft_max(ctx0, ggml_div(ctx0, qk, scale));
++
++    // _, i2 = topk(s_hat.mean(dim=group), k) along the sequence
++    ggml_tensor * group = hsa_perm(ctx0,
++            ggml_mean(ctx0, hsa_perm(ctx0, s_hat, 1, 0, 2, 3)), 1, 0, 2, 3); // [n_kv, 1, Hkv, 1]
++    group = ggml_add(ctx0, group, mask);
++    ggml_tensor * iKV = hsa_perm(ctx0, ggml_top_k(ctx0, group, (int) n_keep), 0, 2, 1, 3);
++
++    // s = softmax((Q @ gather(K, iKV).T) / sqrt(D)); o = s @ gather(V, iKV)
++    ggml_tensor * Ksel = ggml_get_rows(ctx0, K, iKV);
++    ggml_tensor * Vsel = ggml_get_rows(ctx0, V, iKV);
++    ggml_tensor * qk_exact = ggml_mul_mat(ctx0, Ksel, Q);
++    ggml_tensor * probs = ggml_soft_max_ext(ctx0, qk_exact, nullptr, kq_scale, 0.0f);
++    Vsel = ggml_cont(ctx0, ggml_transpose(ctx0, Vsel));
++    ggml_tensor * out = ggml_mul_mat(ctx0, Vsel, probs);
++    out = ggml_cont_2d(ctx0, out, D * Hq, n_tokens);
++
++    cb(out, "hsa_kqv", il);
++    if (!cparams.offload_kqv) {
++        ggml_backend_sched_set_tensor_backend(sched, out, backend_cpu);
++    }
++    ggml_build_forward_expand(gf, out);
++    return out;
++}
++
+ ggml_tensor * llm_graph_context::build_attn(
+         llm_graph_input_attn_kv * inp,
+         ggml_tensor * wo,
+@@ -3377,7 +3495,38 @@ ggml_tensor * llm_graph_context::build_attn(
+     const auto & kq_mask = inp->self_attn_mask.raw;
+     const auto & kv_rows = inp->self_attn_mask.rows;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
++    // rocket.py: prefill (len_q > 1) stays dense. One new token takes the HSA chain.
++    // Parameters come from cparams, copied into this graph by llama_context::graph_params.
++    const int64_t n_kv = k->ne[2];
++    const bool v_trans = v->nb[1] > v->nb[2];
++    const int64_t D   = hparams.n_embd_head_k(il);
++    const int64_t Hq  = hparams.n_head(il);
++    const int64_t Hkv = hparams.n_head_kv(il);
++    const bool hsa = cparams.hsa_topk > 0
++        && cparams.hsa_chunk > 0
++        && cparams.hsa_r > 0
++        && il >= cparams.hsa_skip_layers
++        && n_tokens == 1
++        && n_kv > 0
++        && k->ne[3] == 1
++        && !v_trans
++        && D > 0
++        && D == hparams.n_embd_head_v(il)
++        && Hkv > 0
++        && Hq % Hkv == 0
++        && q->ne[0] == D
++        && q->ne[1] == Hq
++        && kq_b == nullptr
++        && sinks == nullptr
++        && v_mla == nullptr
++        && kv_rows == nullptr
++        && kq_mask
++        && kq_mask->ne[0] == n_kv
++        && kq_mask->ne[1] == n_tokens;
++
++    ggml_tensor * cur = hsa
++        ? build_hsa_decode(q, k, v, kq_mask, kq_scale, il)
++        : build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+     cb(cur, "kqv_out", il);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 2d8c657..4f3be34 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -901,6 +901,14 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // chunk, r, and topk are baked into the HSA nodes
++        if (cparams.hsa_skip_layers != other.cparams.hsa_skip_layers ||
++            cparams.hsa_chunk       != other.cparams.hsa_chunk       ||
++            cparams.hsa_r           != other.cparams.hsa_r           ||
++            cparams.hsa_topk        != other.cparams.hsa_topk) {
++            return false;
++        }
++
+         return
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+@@ -1305,6 +1313,17 @@ struct llm_graph_context {
+                   float   kq_scale,
+                     int   il) const;
+ 
++    // RocketKV stage-2 sparse attention for one decode token.
++    // q: [D, n_head, 1], k/v: [D, n_head_kv, n_kv, 1]
++    // returns [n_embd, 1], the same shape build_attn_mha returns
++    ggml_tensor * build_hsa_decode(
++            ggml_tensor * q,
++            ggml_tensor * k,
++            ggml_tensor * v,
++            ggml_tensor * kq_mask,
++                  float   kq_scale,
++                    int   il) const;
++
+     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+ 
+     ggml_tensor * build_attn(
