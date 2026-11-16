@@ -1,0 +1,11 @@
+--- a/llama.cpp/src/llama-graph.cpp
++++ b/llama.cpp/src/llama-graph.cpp
+@@ -3481,7 +3481,7 @@
+     ggml_tensor * take_max = ggml_step(ctx0, sign);
+     ggml_tensor * chunk_key = ggml_mul(ctx0, ggml_add(ctx0,
+             ggml_mul(ctx0, chunk_max, take_max),
+-            ggml_mul(ctx0, chunk_min, ggml_sub(ctx0, one, take_max))), sign);
++            ggml_mul(ctx0, chunk_min, ggml_sub(ctx0, ggml_repeat(ctx0, one, take_max), take_max))), sign);
+ 
+     // i1 = topk(abs(Q).mean(dim=group), r)
+     ggml_tensor *abs_q = ggml_abs(ctx0, Q);
